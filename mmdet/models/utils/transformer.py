@@ -28,6 +28,16 @@ except ImportError:
         '`mmcv.ops.multi_scale_deform_attn`, please update your MMCV')
     from mmcv.cnn.bricks.transformer import MultiScaleDeformableAttention
 
+# try:
+#     from pytorch_quantization import nn as quant_nn
+#     quant_nn.TensorQuantizer.use_fb_fake_quant = True
+#     from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
+# except ImportError:
+#     raise ImportError(
+#         "pytorch-quantization is not installed. Install from "
+#         "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
+#     )
+
 
 def nlc_to_nchw(x, hw_shape):
     """Convert [N, L, C] shape tensor to [N, C, H, W] shape tensor.
@@ -123,11 +133,13 @@ class AdaptivePadding(nn.Module):
         if pad_h > 0 or pad_w > 0:
             if self.padding == 'corner':
                 x = F.pad(x, [0, pad_w, 0, pad_h])
+                # x = torch.nn.ZeroPad2d([0, pad_w, 0, pad_h])(x)
             elif self.padding == 'same':
                 x = F.pad(x, [
                     pad_w // 2, pad_w - pad_w // 2, pad_h // 2,
                     pad_h - pad_h // 2
                 ])
+                # x = torch.nn.ZeroPad2d([pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])(x)
         return x
 
 
@@ -351,26 +363,53 @@ class PatchMerging(BaseModule):
                 - out_size (tuple[int]): Spatial shape of x, arrange as
                     (Merged_H, Merged_W).
         """
-        B, L, C = x.shape
-        assert isinstance(input_size, Sequence), f'Expect ' \
-                                                 f'input_size is ' \
-                                                 f'`Sequence` ' \
-                                                 f'but get {input_size}'
+        # B, L, C = x.shape
+        # assert isinstance(input_size, Sequence), f'Expect ' \
+        #                                          f'input_size is ' \
+        #                                          f'`Sequence` ' \
+        #                                          f'but get {input_size}'
+
+        # H, W = input_size
+        # assert L == H * W, 'input feature has wrong size'
+
+        # x = x.view(B, H, W, C).permute([0, 3, 1, 2])  # B, C, H, W
+        # # Use nn.Unfold to merge patch. About 25% faster than original method,
+        # # but need to modify pretrained model for compatibility
+
+        # if self.adap_padding:
+        #     x = self.adap_padding(x)
+        #     H, W = x.shape[-2:]
+
+        # x = self.sampler(x)
+        # # if kernel_size=2 and stride=2, x should has shape (B, 4*C, H/2*W/2)
+
+        # out_h = (H + 2 * self.sampler.padding[0] - self.sampler.dilation[0] *
+        #          (self.sampler.kernel_size[0] - 1) -
+        #          1) // self.sampler.stride[0] + 1
+        # out_w = (W + 2 * self.sampler.padding[1] - self.sampler.dilation[1] *
+        #          (self.sampler.kernel_size[1] - 1) -
+        #          1) // self.sampler.stride[1] + 1
+
+        # output_size = (out_h, out_w)
+        # x = x.transpose(1, 2)  # B, H/2*W/2, 4*C
+
 
         H, W = input_size
-        assert L == H * W, 'input feature has wrong size'
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
 
-        x = x.view(B, H, W, C).permute([0, 3, 1, 2])  # B, C, H, W
-        # Use nn.Unfold to merge patch. About 25% faster than original method,
-        # but need to modify pretrained model for compatibility
+        x = x.view(B, H, W, C)
 
-        if self.adap_padding:
-            x = self.adap_padding(x)
-            H, W = x.shape[-2:]
-
-        x = self.sampler(x)
-        # if kernel_size=2 and stride=2, x should has shape (B, 4*C, H/2*W/2)
-
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x2 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+        x = x.view(x.shape[0], x.shape[1], 4, -1).permute(0, 1, 3,2).contiguous().view(x.shape[0], x.shape[1], -1)
+        x = self.norm(x) if self.norm else x
+        x = self.reduction(x)
         out_h = (H + 2 * self.sampler.padding[0] - self.sampler.dilation[0] *
                  (self.sampler.kernel_size[0] - 1) -
                  1) // self.sampler.stride[0] + 1
@@ -379,9 +418,6 @@ class PatchMerging(BaseModule):
                  1) // self.sampler.stride[1] + 1
 
         output_size = (out_h, out_w)
-        x = x.transpose(1, 2)  # B, H/2*W/2, 4*C
-        x = self.norm(x) if self.norm else x
-        x = self.reduction(x)
         return x, output_size
 
 
