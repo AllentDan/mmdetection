@@ -18,16 +18,6 @@ from ..builder import BACKBONES
 from ..utils.ckpt_convert import swin_converter
 from ..utils.transformer import PatchEmbed, PatchMerging
 
-# try:
-#     from pytorch_quantization import nn as quant_nn
-#     quant_nn.TensorQuantizer.use_fb_fake_quant = True
-#     from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
-# except ImportError:
-#     raise ImportError(
-#         "pytorch-quantization is not installed. Install from "
-#         "https://github.com/NVIDIA/TensorRT/tree/master/tools/pytorch-quantization."
-#     )
-
 
 class WindowMSA(BaseModule):
     """Window based multi-head self-attention (W-MSA) module with relative
@@ -121,10 +111,17 @@ class WindowMSA(BaseModule):
             attn = attn.view(-1, nW, self.num_heads, N,
                              N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-        # attn = self.softmax(attn)
-        attn = attn - attn.mean(dim=self.softmax.dim, keepdim=True)
-        attn = torch.exp(attn) / torch.exp(attn).sum(dim=self.softmax.dim, keepdim=True)
+        attn = self.softmax(attn)
+        # attn = attn - attn.mean()
+        # attn = torch.exp(attn) / torch.exp(attn).sum(
+        #     dim=self.softmax.dim, keepdim=True)
 
+        # means = torch.mean(attn, self.softmax.dim, keepdim=True)[0]
+        # attn_exp = torch.exp(attn - means)
+        # attn_exp_sum = torch.sum(attn_exp, self.softmax.dim, keepdim=True)
+        # attn = attn_exp / attn_exp_sum
+
+        # attn = torch.exp(torch.log_softmax(attn, dim=self.softmax.dim))
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).contiguous().reshape(B, N, C)
@@ -191,7 +188,7 @@ class ShiftWindowMSA(BaseModule):
 
         self.drop = build_dropout(dropout_layer)
 
-    def forward(self, query, hw_shape, debug = False):
+    def forward(self, query, hw_shape, debug=False):
         B, L, C = query.shape
         H, W = hw_shape
         assert L == H * W, 'input feature has wrong size'
@@ -202,9 +199,12 @@ class ShiftWindowMSA(BaseModule):
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         # query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
         query = query.permute(0, 3, 1, 2).contiguous()
-        query = torch.nn.ZeroPad2d([0, self.window_size, 0, self.window_size])(query)
-        slice_h = (H + self.window_size - 1) // self.window_size * self.window_size
-        slice_w = (W + self.window_size - 1) // self.window_size * self.window_size
+        query = torch.nn.ZeroPad2d([0, self.window_size, 0, self.window_size])(
+            query)
+        slice_h = (H + self.window_size -
+                   1) // self.window_size * self.window_size
+        slice_w = (W + self.window_size -
+                   1) // self.window_size * self.window_size
         query = query[:, :, :slice_h, :slice_w]
         query = query.permute(0, 2, 3, 1).contiguous()
         H_pad, W_pad = query.shape[1], query.shape[2]
@@ -283,10 +283,8 @@ class ShiftWindowMSA(BaseModule):
         """
         window_size = self.window_size
         B = int(windows.shape[0] / (H * W / window_size / window_size))
-        x = windows.view(B, -1, W,
-                         window_size, windows.shape[-1])
-        x = x.view(B, x.shape[1], -1, window_size,
-                         window_size, x.shape[-1])
+        x = windows.view(B, -1, W, window_size, windows.shape[-1])
+        x = x.view(B, x.shape[1], -1, window_size, window_size, x.shape[-1])
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, x.shape[-1])
         return x
 
@@ -299,10 +297,8 @@ class ShiftWindowMSA(BaseModule):
         """
         B, H, W, C = x.shape
         window_size = self.window_size
-        x = x.view(B,H, -1,
-                   window_size, C)
-        x = x.view(B, -1, window_size, x.shape[-3],
-                   window_size, C)
+        x = x.view(B, H, -1, window_size, C)
+        x = x.view(B, -1, window_size, x.shape[-3], window_size, C)
         windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
         windows = windows.view(-1, window_size, window_size, C)
         return windows
